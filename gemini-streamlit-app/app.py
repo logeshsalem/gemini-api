@@ -5,6 +5,8 @@ from typing import List, Dict, Any
 
 import streamlit as st
 from PIL import Image
+
+# SDK: keep using the widely adopted google-generativeai package
 import google.generativeai as genai
 
 
@@ -16,20 +18,23 @@ st.set_page_config(
     page_icon="✨",
     layout="centered",
     menu_items={
-        "About": "A minimal, production-ready Streamlit chat UI for Gemini (Google Generative AI).",
+        "About": "A Streamlit chat UI for the Gemini API with model auto-discovery and streaming.",
     },
 )
-
 st.title("✨ Gemini Chat — Streamlit")
-st.caption("Built with `google-generativeai` + Streamlit. Supports chat history, streaming, and image input.")
+st.caption(
+    "Updated for Gemini **2.5**. Uses `google-generativeai` + Streamlit. "
+    "Supports chat history, streaming, and image input."
+)
 
 
 # ----------------------------
 # Helpers
 # ----------------------------
-
 def get_api_key() -> str:
-    """Resolve API key from secrets, env var, or sidebar input."""
+    """
+    Resolve API key from Streamlit secrets, env var, or sidebar input.
+    """
     key = None
     try:
         if "GOOGLE_API_KEY" in st.secrets:
@@ -40,7 +45,11 @@ def get_api_key() -> str:
     if not key:
         with st.sidebar:
             st.error("No API key found. Enter your Gemini API key to continue.")
-            key = st.text_input("GOOGLE_API_KEY", type="password", placeholder="Paste your API key here…")
+            key = st.text_input(
+                "GOOGLE_API_KEY",
+                type="password",
+                placeholder="Paste your API key here…",
+            )
             if key:
                 st.info("Using the key you entered for this session.")
     return key
@@ -55,6 +64,55 @@ def safe_configure_genai(api_key: str) -> bool:
         return False
 
 
+@st.cache_data(ttl=3600, show_spinner=False)
+def fetch_models_for_generate_content() -> List[str]:
+    """
+    Query the Gemini API for models and return names that support generateContent.
+    Falls back to current stable 2.5 names if listing fails.
+
+    Docs: models.list and models.generateContent (REST)  -> ai.google.dev
+    """
+    try:
+        names: List[str] = []
+        for m in genai.list_models():
+            # Try multiple attribute names across SDK versions
+            methods = (
+                getattr(m, "supported_generation_methods", None)
+                or getattr(m, "supportedGenerationMethods", None)
+                or getattr(m, "supported_actions", None)
+                or getattr(m, "supportedActions", None)
+                or []
+            )
+            # Normalize to lowercase for safety
+            methods_lower = [str(x).lower() for x in methods]
+            if "generatecontent" in methods_lower or "generate_content" in methods_lower:
+                name = getattr(m, "name", "")
+                if name.startswith("models/"):
+                    name = name.split("/", 1)[1]  # strip "models/"
+                if name.startswith("gemini"):
+                    names.append(name)
+
+        # Prefer 2.5 family at the top
+        preferred_order = [
+            "gemini-2.5-flash",
+            "gemini-2.5-pro",
+            "gemini-2.5-flash-lite",
+        ]
+        uniq = []
+        for n in names:
+            if n not in uniq:
+                uniq.append(n)
+        uniq.sort(key=lambda x: (preferred_order.index(x) if x in preferred_order else 999, x))
+        if uniq:
+            return uniq
+
+    except Exception:
+        pass
+
+    # Fallback to current stable choices if listing fails (reduces 404 risk)
+    return ["gemini-2.5-flash", "gemini-2.5-pro"]
+
+
 def compute_config_hash(model_name: str, system_instruction: str, gen_config: Dict[str, Any]) -> str:
     import json
     h = hashlib.sha256()
@@ -65,7 +123,9 @@ def compute_config_hash(model_name: str, system_instruction: str, gen_config: Di
 
 
 def show_message(role: str, text: str = "", images: List[bytes] = None):
-    """Render a chat message with optional images."""
+    """
+    Render a chat message with optional images.
+    """
     with st.chat_message(role):
         if text:
             st.markdown(text)
@@ -82,13 +142,10 @@ def show_message(role: str, text: str = "", images: List[bytes] = None):
 def init_session_state():
     if "messages" not in st.session_state:
         st.session_state.messages = []  # [{role: "user"|"assistant", "text": str, "images": [bytes,...]}]
-
     if "chat" not in st.session_state:
         st.session_state.chat = None
-
     if "config_hash" not in st.session_state:
         st.session_state.config_hash = ""
-
     if "pending_attachments" not in st.session_state:
         st.session_state.pending_attachments = []  # list of raw bytes
 
@@ -101,11 +158,19 @@ init_session_state()
 # ----------------------------
 with st.sidebar:
     st.subheader("⚙️ Settings")
+
+    available_models = fetch_models_for_generate_content()
+    # Default to gemini-2.5-flash if present; else first item
+    default_index = available_models.index("gemini-2.5-flash") if "gemini-2.5-flash" in available_models else 0
+
     model_name = st.selectbox(
         "Model",
-        options=["gemini-1.5-flash", "gemini-1.5-pro"],
-        index=0,
-        help="Choose a Gemini model. Flash is great for fast, general tasks; Pro is better for complex reasoning."
+        options=available_models,
+        index=default_index,
+        help=(
+            "Models are fetched from the Gemini API (models.list) and filtered "
+            "to those that support generateContent."
+        ),
     )
 
     temperature = st.slider("Temperature", 0.0, 2.0, 0.7, 0.1, help="Creativity vs. determinism.")
@@ -121,10 +186,7 @@ with st.sidebar:
 
     st.markdown("---")
     st.caption("🔒 API Key")
-    st.write(
-        "Set `GOOGLE_API_KEY` via **Secrets** or **Environment**. "
-        "You can also paste it below for this session."
-    )
+    st.write("Set `GOOGLE_API_KEY` via **Secrets** or **Environment**. You can also paste it below for this session.")
 
     # Attachments manager
     st.markdown("---")
@@ -132,7 +194,7 @@ with st.sidebar:
     uploads = st.file_uploader(
         "Supported: PNG, JPG, JPEG, WEBP",
         type=["png", "jpg", "jpeg", "webp"],
-        accept_multiple_files=True
+        accept_multiple_files=True,
     )
     if uploads:
         st.session_state.pending_attachments = [u.getvalue() for u in uploads]
@@ -187,7 +249,7 @@ if (st.session_state.chat is None) or (st.session_state.config_hash != current_c
 if len(st.session_state.messages) == 0:
     show_message(
         "assistant",
-        "Hi! I’m Gemini running in Streamlit. Ask me anything, or attach an image for multimodal reasoning. 🚀"
+        "Hi! I’m Gemini running in Streamlit. Ask me anything, or attach an image for multimodal reasoning. 🚀",
     )
 else:
     for msg in st.session_state.messages:
@@ -230,7 +292,7 @@ if user_prompt:
             response = st.session_state.chat.send_message(
                 parts,
                 generation_config=generation_config,
-                stream=True
+                stream=True,
             )
 
             for chunk in response:
@@ -245,7 +307,16 @@ if user_prompt:
             st.session_state.messages.append({"role": "assistant", "text": full_text, "images": []})
 
         except Exception as e:
-            stream_placeholder.error(f"Error: {e}")
+            # Helpful hint for model-not-found cases (404) without spamming the UI
+            err = str(e)
+            if "is not found" in err and "models/" in err:
+                stream_placeholder.error(
+                    f"{err}\n\nTip: Pick another model in the sidebar. "
+                    "The list is fetched from models.list (Gemini API), "
+                    "but availability can change by region/account."
+                )
+            else:
+                stream_placeholder.error(f"Error: {e}")
 
     # Clear pending attachments after use
     st.session_state.pending_attachments = []
